@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""
+Consensus Trading Bot v1.0
+- Analyzes XAUUSD + GBPJPY with Claude + Gemini
+- Auto-executes when both AIs agree at 90%+ confidence
+- Sends Telegram notifications
+"""
+
+import asyncio
+import logging
+import os
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+import requests
+
+from metaapi_cloud_sdk import MetaApi
+from ai_consensus import AIConsensusEngine
+
+load_dotenv(os.path.expanduser('~/.env'))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class TelegramNotifier:
+    """Sends trading alerts via Telegram"""
+    
+    def __init__(self, bot_token: str, chat_id: str = None):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{bot_token}"
+    
+    def send_message(self, message: str):
+        """Send message to Telegram"""
+        if not self.chat_id:
+            logger.warning("Chat ID not set. Run bot once to get it.")
+            return
+        
+        try:
+            url = f"{self.base_url}/sendMessage"
+            data = {"chat_id": self.chat_id, "text": message}
+            response = requests.post(url, data=data)
+            if response.status_code == 200:
+                logger.info("✅ Telegram message sent")
+            else:
+                logger.error(f"❌ Telegram error: {response.text}")
+        except Exception as e:
+            logger.error(f"❌ Telegram error: {e}")
+    
+    def get_updates(self):
+        """Get latest message to find chat_id"""
+        try:
+            url = f"{self.base_url}/getUpdates"
+            response = requests.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('result'):
+                    chat_id = data['result'][-1]['message']['chat']['id']
+                    return str(chat_id)
+        except Exception as e:
+            logger.error(f"Error getting chat_id: {e}")
+        return None
+
+
+class ConsensusBot:
+    """Main trading bot using AI consensus"""
+    
+    def __init__(self):
+        self.metaapi_token = os.getenv('METAAPI_TOKEN')
+        self.account_id = os.getenv('METAAPI_ACCOUNT_ID')
+        self.claude_key = os.getenv('ANTHROPIC_API_KEY')
+        self.gemini_key = os.getenv('GEMINI_API_KEY')
+        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.pairs = os.getenv('TRADING_PAIRS', 'XAUUSD,GBPJPY').split(',')
+        
+        self.ai_engine = AIConsensusEngine(self.claude_key, self.gemini_key)
+        self.telegram = TelegramNotifier(self.telegram_token, os.getenv('TELEGRAM_CHAT_ID'))
+        self.account = None
+        
+    async def initialize(self):
+        """Initialize MetaAPI connection"""
+        logger.info("🚀 Initializing Consensus Trading Bot...")
+        
+        try:
+            api = MetaApi(self.metaapi_token)
+            self.account = await api.metatrader_account_api.get_account(self.account_id)
+            
+            logger.info(f"✅ Connected to account: {self.account_id}")
+            logger.info(f"Account state: {self.account.state}")
+            
+            if self.account.state == 'DEPLOYED':
+                await asyncio.sleep(2)
+                if await self.account.is_connected():
+                    logger.info("✅ Account connected to MetaTrader")
+                    
+                    try:
+                        account_info = await self.account.get_account_information()
+                        logger.info(f"💰 Balance: ${account_info['balance']:.2f}")
+                        logger.info(f"💰 Equity: ${account_info['equity']:.2f}")
+                        
+                        chat_id = self.telegram.get_updates()
+                        if chat_id:
+                            self.telegram.chat_id = chat_id
+                            logger.info(f"✅ Telegram Chat ID: {chat_id}")
+                            self.telegram.send_message("🤖 Consensus Trading Bot Started!\n\nMonitoring XAUUSD + GBPJPY\nWaiting for AI signals...")
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not get account info: {e}")
+                else:
+                    logger.error("Account not connected to MetaTrader")
+                    return False
+            else:
+                logger.error(f"Account state: {self.account.state}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Initialization error: {e}")
+            return False
+    
+    async def get_market_data(self, symbol: str) -> dict:
+        """Get current market data"""
+        try:
+            candles = await self.account.get_candles(symbol=symbol, timeframe='1h', limit=50)
+            
+            if not candles:
+                return None
+            
+            latest = candles[-1]
+            prices = [c['close'] for c in candles[-20:]]
+            
+            market_data = {
+                "symbol": symbol,
+                "timeframe": "1H",
+                "current_price": latest['close'],
+                "open": latest['open'],
+                "high": latest['high'],
+                "low": latest['low'],
+                "close": latest['close'],
+                "volume": latest.get('tickVolume', 0),
+                "moving_average_20": sum(prices[-20:]) / 20 if len(prices) >= 20 else sum(prices) / len(prices),
+                "trend": "uptrend" if prices[-1] > sum(prices[-10:]) / 10 else "downtrend",
+                "support_level": min([c['low'] for c in candles[-20:]]),
+                "resistance_level": max([c['high'] for c in candles[-20:]])
+            }
+            
+            return market_data
+            
+        except Exception as e:
+            logger.error(f"Error getting market data for {symbol}: {e}")
+            return None
+    
+    async def analyze_and_trade(self):
+        """Main trading loop"""
+        logger.info(f"\n{'='*60}")
+        logger.info(f"ANALYSIS CYCLE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"{'='*60}")
+        
+        for symbol in self.pairs:
+            logger.info(f"\n🔍 Analyzing {symbol}...")
+            
+            market_data = await self.get_market_data(symbol)
+            if not market_data:
+                continue
+            
+            consensus = await self.ai_engine.get_consensus(market_data, min_confidence=90)
+            
+            if consensus['agree'] and consensus['signal'] != 'NO_TRADE':
+                await self.execute_trade(symbol, consensus)
+            else:
+                logger.info(f"⏭️  No trade signal for {symbol}")
+    
+    async def execute_trade(self, symbol: str, consensus: dict):
+        """Execute trade based on consensus"""
+        
+        direction = consensus['signal']
+        entry = consensus['entry_price']
+        sl = consensus['stop_loss']
+        tp = consensus['take_profit']
+        confidence = consensus['confidence']
+        
+        logger.info(f"\n🎯 TRADE SIGNAL READY")
+        logger.info(f"   Symbol: {symbol}")
+        logger.info(f"   Direction: {direction}")
+        logger.info(f"   Entry: {entry:.5f}")
+        logger.info(f"   SL: {sl:.5f}")
+        logger.info(f"   TP: {tp:.5f}")
+        logger.info(f"   AI Confidence: {confidence}%")
+        
+        try:
+            telegram_msg = f"""
+🤖 CONSENSUS TRADE SIGNAL
+
+📊 Symbol: {symbol}
+📈 Direction: {direction}
+🎯 Entry: {entry:.5f}
+🛑 Stop Loss: {sl:.5f}
+💰 Take Profit: {tp:.5f}
+📊 AI Confidence: {confidence}%
+
+Claude + Gemini both agree at {confidence}% confidence!
+            """
+            
+            self.telegram.send_message(telegram_msg)
+            logger.info(f"✅ Trade alert sent to Telegram")
+            
+        except Exception as e:
+            logger.error(f"❌ Error: {e}")
+    
+    async def run(self):
+        """Main bot loop"""
+        
+        if not await self.initialize():
+            logger.error("Failed to initialize")
+            return
+        
+        logger.info("\n✅ Bot is ready!")
+        logger.info(f"Monitoring: {', '.join(self.pairs)}")
+        logger.info("Press Ctrl+C to stop\n")
+        
+        try:
+            while True:
+                await self.analyze_and_trade()
+                logger.info("\n⏳ Waiting 3600 seconds (1 hour) until next analysis...")
+                await asyncio.sleep(3600)
+                
+        except KeyboardInterrupt:
+            logger.info("\n🛑 Bot stopped")
+            self.telegram.send_message("🛑 Consensus Trading Bot stopped")
+        except Exception as e:
+            logger.error(f"❌ Error: {e}")
+            self.telegram.send_message(f"❌ Bot error: {e}")
+
+
+async def main():
+    bot = ConsensusBot()
+    await bot.run()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
